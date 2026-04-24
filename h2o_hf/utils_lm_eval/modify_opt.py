@@ -86,6 +86,9 @@ class OPTAttention_Mask(nn.Module):
         dropout: float = 0.0,
         is_decoder: bool = False,
         bias: bool = True,
+        hh_adaptive: str = "none",
+        hh_adaptive_ref_len: int = 512,
+        hh_min_ratio: float = 0.05,
     ):
         super().__init__()
         self.embed_dim = embed_dim
@@ -108,6 +111,26 @@ class OPTAttention_Mask(nn.Module):
 
         self.heavy_budget_ratio = heavy_ratio
         self.recent_budget_ratio = recent_ratio
+
+        # H2O optimization (A): adaptive heavy-hitter ratio
+        self.hh_adaptive = hh_adaptive
+        self.hh_adaptive_ref_len = hh_adaptive_ref_len
+        self.hh_min_ratio = hh_min_ratio
+
+    def _effective_heavy_ratio(self, seq_len):
+        base = self.heavy_budget_ratio
+        mode = self.hh_adaptive
+        if mode == "none" or seq_len <= 0:
+            return base
+        ref = max(1, self.hh_adaptive_ref_len)
+        if mode == "sqrt":
+            r = base * (ref / max(seq_len, 1)) ** 0.5
+        elif mode == "log":
+            import math
+            r = base * (math.log2(max(ref, 2)) / math.log2(max(seq_len, 2)))
+        else:
+            raise ValueError(f"Unknown hh_adaptive mode: {mode}")
+        return float(min(base, max(self.hh_min_ratio, r)))
 
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
         return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
@@ -185,8 +208,10 @@ class OPTAttention_Mask(nn.Module):
             attn_weights = attn_weights.view(bsz * self.num_heads, tgt_len, src_len)
 
         ### Heavy + Recent
-        heavy_budget = int(self.heavy_budget_ratio * attn_weights.shape[-1])
-        recent_budget = int(self.recent_budget_ratio * attn_weights.shape[-1])
+        seq_len = attn_weights.shape[-1]
+        eff_heavy_ratio = self._effective_heavy_ratio(seq_len)
+        heavy_budget = int(eff_heavy_ratio * seq_len)
+        recent_budget = int(self.recent_budget_ratio * seq_len)
 
         # Heavy Hitter Mask
         if heavy_budget > 0:
@@ -268,6 +293,9 @@ def convert_kvcache_opt_heavy_recent(model, config):
                 dropout=config.attention_dropout,
                 is_decoder=True,
                 bias=config.enable_bias,
+                hh_adaptive=getattr(config, "hh_adaptive", "none"),
+                hh_adaptive_ref_len=getattr(config, "hh_adaptive_ref_len", 512),
+                hh_min_ratio=getattr(config, "hh_min_ratio", 0.05),
             )
     return model
 

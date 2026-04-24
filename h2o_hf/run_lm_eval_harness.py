@@ -33,6 +33,15 @@ if __name__ == '__main__':
 
     parser.add_argument("--heavy_ratio", type=float, default=0.1)
     parser.add_argument("--recent_ratio", type=float, default=0.1)
+
+    # H2O optimization (A): adaptive heavy-hitter ratio
+    parser.add_argument("--hh-adaptive", dest="hh_adaptive", type=str, default="none",
+                        choices=["none", "sqrt", "log"],
+                        help="Adaptive heavy-hitter ratio scaling mode.")
+    parser.add_argument("--hh-adaptive-ref-len", dest="hh_adaptive_ref_len", type=int, default=512,
+                        help="Reference sequence length used by --hh-adaptive.")
+    parser.add_argument("--hh-min-ratio", dest="hh_min_ratio", type=float, default=0.02,
+                        help="Lower bound on the effective heavy ratio when adaptive.")
     args = parser.parse_args()
 
     input_path = args.input_path
@@ -47,6 +56,9 @@ if __name__ == '__main__':
         print('Enable Small Cache Size')
         config.heavy_ratio = args.heavy_ratio
         config.recent_ratio = args.recent_ratio
+        config.hh_adaptive = args.hh_adaptive
+        config.hh_adaptive_ref_len = args.hh_adaptive_ref_len
+        config.hh_min_ratio = args.hh_min_ratio
         checkpoint = copy.deepcopy(model.state_dict())
         model = ENABLE_Heavy_Hitter_FUNCTIONS[args.model_type](model, config)
         model.load_state_dict(checkpoint)
