@@ -73,6 +73,32 @@ class Policy:
     hh_all: bool = False
     hh_long_seq: bool = False
 
+    # --- H2O optimizations ---
+    # Adaptive heavy-hitter ratio. Modes:
+    #   "none"  : use a fixed hh_ratio (paper default)
+    #   "sqrt"  : effective_ratio = hh_ratio * sqrt(ref_len / prompt_len)
+    #   "log"   : effective_ratio = hh_ratio * log2(ref_len) / log2(prompt_len)
+    # The effective ratio is clamped to [hh_min_ratio, hh_ratio].
+    hh_adaptive: str = "none"
+    hh_adaptive_ref_len: int = 512
+    hh_min_ratio: float = 0.05
+
+    # Layer-wise KV cache budget allocation. Schedules:
+    #   "uniform"          : every transformer layer uses the same hh_k (default)
+    #   "pyramid"          : earlier layers get a larger budget, later layers smaller
+    #   "inverted-pyramid" : earlier layers get a smaller budget, later layers larger
+    #   "edge-heavy"       : first/last layers get larger budget, middle smaller
+    # The schedule is normalized so that the total budget across layers equals
+    # the uniform budget (preserving overall memory footprint).
+    hh_layer_schedule: str = "uniform"
+    hh_layer_skew: float = 0.5  # 0 = uniform, 1 = strong skew
+
+    # Recency-decayed accumulated attention score. alpha in (0, 1].
+    # Implements a hybrid heavy-hitter + recency policy:
+    #   acc <- alpha * acc + attn_weights
+    # alpha = 1.0 reproduces the original H2O policy.
+    hh_recency_decay: float = 1.0
+
     @property
     def w_disk_percent(self):
         return 100 - self.w_gpu_percent - self.w_cpu_percent
@@ -84,6 +110,58 @@ class Policy:
     @property
     def act_disk_percent(self):
         return 100 - self.act_gpu_percent - self.act_cpu_percent
+
+
+def compute_adaptive_hh_k(prompt_len, policy):
+    """Compute the base heavy-hitter budget for a given prompt length.
+
+    Returns at least 1 token. The fixed-ratio H2O behavior is recovered when
+    `policy.hh_adaptive == "none"`.
+    """
+    base_ratio = policy.hh_ratio
+    mode = policy.hh_adaptive
+    if mode == "none" or prompt_len <= 0:
+        eff_ratio = base_ratio
+    else:
+        ref = max(1, policy.hh_adaptive_ref_len)
+        if mode == "sqrt":
+            eff_ratio = base_ratio * (ref / max(prompt_len, 1)) ** 0.5
+        elif mode == "log":
+            denom = np.log2(max(prompt_len, 2))
+            eff_ratio = base_ratio * (np.log2(max(ref, 2)) / denom)
+        else:
+            raise ValueError(f"Unknown hh_adaptive mode: {mode}")
+        eff_ratio = float(min(base_ratio, max(policy.hh_min_ratio, eff_ratio)))
+    return max(1, int(prompt_len * eff_ratio))
+
+
+def layer_hh_k(base_hh_k, layer_id, num_attn_layers, policy):
+    """Compute a per-layer heavy-hitter budget.
+
+    The per-layer weights are normalized by their *discrete* mean over the
+    actual layer indices so that the average across attention layers equals
+    `base_hh_k`, preserving the overall memory footprint of the cache.
+    """
+    schedule = policy.hh_layer_schedule
+    if schedule == "uniform" or num_attn_layers <= 1:
+        return base_hh_k
+
+    skew = float(np.clip(policy.hh_layer_skew, 0.0, 1.0))
+
+    def raw_weight(li):
+        x = li / (num_attn_layers - 1)
+        if schedule == "pyramid":
+            return (1.0 + skew) - 2.0 * skew * x
+        if schedule == "inverted-pyramid":
+            return (1.0 - skew) + 2.0 * skew * x
+        if schedule == "edge-heavy":
+            return (1.0 - skew) + 2.0 * skew * (2.0 * x - 1.0) ** 2
+        raise ValueError(f"Unknown hh_layer_schedule: {schedule}")
+
+    weights = [raw_weight(li) for li in range(num_attn_layers)]
+    mean_w = sum(weights) / len(weights)
+    w = weights[layer_id] / max(mean_w, 1e-6)
+    return max(1, int(round(base_hh_k * w)))
 
 
 def get_choice(cur_percent, percents, choices):
@@ -286,7 +364,9 @@ class SelfAttention:
 
     def set_task(self, task):
         self.task = task
-        self.hh_k = int(task.prompt_len * self.policy.hh_ratio)
+        base_hh_k = compute_adaptive_hh_k(task.prompt_len, self.policy)
+        num_attn_layers = self.config.num_hidden_layers
+        self.hh_k = layer_hh_k(base_hh_k, self.layer_id, num_attn_layers, self.policy)
 
     def init_weight(self, weight_home, path):
         h, dtype = (self.config.input_dim, self.config.dtype)
@@ -502,7 +582,7 @@ class SelfAttention:
                 b_q, w_k, b_k, w_v, b_v, w_out, b_out, w_ln, b_ln, n_head,
                 k_cache, v_cache, acc, donate, self.policy.attn_sparsity,
                 self.policy.compress_cache, self.policy.comp_cache_config,
-                self.hh_k, self.policy.hh_all)
+                self.hh_k, self.policy.hh_all, self.policy.hh_recency_decay)
             # if self.layer_id == 10:
             #     print(h.data)
             cache_write_buf.store((new_k_cache, new_v_cache, acc, kick_ind))
@@ -691,7 +771,14 @@ class OptLM:
         self.task = task
         for l in self.layers:
             l.set_task(task)
-        self.hh_k = int(task.prompt_len * self.policy.hh_ratio)
+        # OptLM-level hh_k is used to size the (shared) CPU compute workspace.
+        # When per-layer schedules vary, we must size the workspace using the
+        # maximum per-layer budget so every layer fits.
+        base_hh_k = compute_adaptive_hh_k(task.prompt_len, self.policy)
+        n = self.config.num_hidden_layers
+        self.hh_k = max(
+            layer_hh_k(base_hh_k, lid, n, self.policy) for lid in range(n)
+        )
 
     def init_weight(self, j):
         expanded_path = os.path.abspath(os.path.expanduser(
@@ -1294,7 +1381,13 @@ def run_flexgen(args):
                                       group_dim=2, symmetric=False),
                     hh_ratio=args.hh_ratio,
                     hh_all=args.hh_all,
-                    hh_long_seq=args.hh_long_seq)
+                    hh_long_seq=args.hh_long_seq,
+                    hh_adaptive=args.hh_adaptive,
+                    hh_adaptive_ref_len=args.hh_adaptive_ref_len,
+                    hh_min_ratio=args.hh_min_ratio,
+                    hh_layer_schedule=args.hh_layer_schedule,
+                    hh_layer_skew=args.hh_layer_skew,
+                    hh_recency_decay=args.hh_recency_decay)
     assert not (args.compress_cache and args.attn_sparsity < 1.0), "Not implemented"
 
     opt_config = get_opt_config(args.model)
@@ -1403,6 +1496,23 @@ def add_parser_arguments(parser):
                         help="ratio of the prompt seq length")
     parser.add_argument("--hh-all", type=str2bool, nargs='?', const=True, default=False)
     parser.add_argument("--hh-long-seq", type=str2bool, nargs='?', const=True, default=False)
+
+    # H2O optimizations
+    parser.add_argument("--hh-adaptive", type=str, default="none",
+                        choices=["none", "sqrt", "log"],
+                        help="Adaptive heavy-hitter ratio scaling mode.")
+    parser.add_argument("--hh-adaptive-ref-len", type=int, default=512,
+                        help="Reference prompt length used by --hh-adaptive.")
+    parser.add_argument("--hh-min-ratio", type=float, default=0.05,
+                        help="Lower bound on the effective hh_ratio when adaptive.")
+    parser.add_argument("--hh-layer-schedule", type=str, default="uniform",
+                        choices=["uniform", "pyramid", "inverted-pyramid", "edge-heavy"],
+                        help="Per-layer heavy-hitter budget allocation schedule.")
+    parser.add_argument("--hh-layer-skew", type=float, default=0.5,
+                        help="Skew strength of the layer schedule in [0, 1].")
+    parser.add_argument("--hh-recency-decay", type=float, default=1.0,
+                        help="Multiplicative decay alpha applied to the accumulated "
+                             "attention scores each decoding step. 1.0 reproduces H2O.")
 
     parser.add_argument("--log-file", type=str, default="auto")
     parser.add_argument("--no-log", action="store_true")

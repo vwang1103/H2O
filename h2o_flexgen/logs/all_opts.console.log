@@ -1,0 +1,26 @@
+/venv/h2o/lib/python3.10/site-packages/huggingface_hub/file_download.py:949: FutureWarning: `resume_download` is deprecated and will be removed in version 1.0.0. Downloads always resume when possible. If you want to force a new download, use `force_download=True`.
+  warnings.warn(
+2048
+model size: 12.386 GB, cache size: 48.000 GB, hidden size (prefill): 0.750 GB
+init weight...
+== after init weight ==
+used:   30 GB, free:   80 GB, cached:  407 GB, available:  474 GB
+warmup - generate
+benchmark - generate
+== after init cache ==
+used:   30 GB, free:   80 GB, cached:  407 GB, available:  474 GB
+/root/H2O/h2o_flexgen/flexgen/pytorch_backend.py:976: UserWarning: To copy construct from a tensor, it is recommended to use sourceTensor.detach().clone() or sourceTensor.detach().clone().requires_grad_(True), rather than torch.tensor(sourceTensor).
+  least_recent = torch.tensor(dst.data[oldest]).unsqueeze(0).to(dst.data.device)
+/root/H2O/h2o_flexgen/flexgen/pytorch_backend.py:999: UserWarning: To copy construct from a tensor, it is recommended to use sourceTensor.detach().clone() or sourceTensor.detach().clone().requires_grad_(True), rather than torch.tensor(sourceTensor).
+  least_recent = torch.tensor(src.data[oldest]).unsqueeze(0).to(dst.data.device)
+/venv/h2o/lib/python3.10/site-packages/torch/__init__.py:1164: FutureWarning: `torch.distributed.reduce_op` is deprecated, please use `torch.distributed.ReduceOp` instead
+  return isinstance(obj, torch.Tensor)
+TorchDevice: cuda:0
+  cur_mem: 12.7949 GB,  peak_mem: 43.5675 GB
+TorchDevice: cpu
+  cur_mem: 0.0000 GB,  peak_mem: 0.0000 GB
+model size: 12.386 GB	cache size: 48.000 GB	hidden size (p): 0.750 GB
+peak gpu mem: 43.567 GB	projected: True
+prefill latency: 5.349 s	prefill throughput: 9188.767 token/s
+decode latency: 38.604 s	decode throughput: 1272.601 token/s
+total latency: 43.954 s	total throughput: 1118.271 token/s

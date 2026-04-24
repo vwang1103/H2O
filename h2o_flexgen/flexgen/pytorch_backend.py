@@ -398,7 +398,7 @@ class TorchDevice:
     def mha_gen(self, inputs, attention_mask, w_q, b_q, w_k, b_k, w_v, b_v,
                 w_out, b_out, w_ln, b_ln, n_head, k_cache, v_cache, acc, donate,
                 attn_sparsity, compress_cache, comp_config,
-                hh_k=None, hh_all=False):
+                hh_k=None, hh_all=False, recency_decay=1.0):
         """Multi-head attention (decoding phase)."""
         # decompress weights
         if w_q.device.device_type == DeviceType.COMPRESSED:
@@ -527,7 +527,14 @@ class TorchDevice:
             # (s, b * n_head)
             acc.data = acc.data.cuda()
             acc.data[-1] = 0
-            acc.data = acc.data + attn_weights
+            if recency_decay is not None and recency_decay != 1.0:
+                # Hybrid heavy-hitter + recency: down-weight stale scores so
+                # tokens that stop being attended to gradually decay and become
+                # candidates for eviction. recency_decay == 1.0 reproduces the
+                # original H2O accumulator.
+                acc.data = recency_decay * acc.data + attn_weights
+            else:
+                acc.data = acc.data + attn_weights
             # print("acc.data", acc.data.shape, acc.data[:, -4])
             kick_ind = self._get_light_hitter(acc.data[:src_s - hh_k, :])
             if not k.is_cuda:
